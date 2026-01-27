@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sentence-transformers
+supabase
+groq
+pydantic
+python-multipart
+dotenv

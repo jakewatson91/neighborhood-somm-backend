@@ -1,6 +1,7 @@
 import pandas as pd
 import json
 import re
+from pathlib import Path
 
 def clean_html(raw_html):
     """One-liner regex to strip tags. Fast and sufficient for Shopify descriptions."""
