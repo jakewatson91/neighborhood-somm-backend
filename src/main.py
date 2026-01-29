@@ -13,7 +13,7 @@ from groq import AsyncGroq
 from supabase import create_client, Client
 from huggingface_hub import InferenceClient
 
-from prompts import SOMMELIER_SYSTEM_PROMPT
+from .prompts import SOMMELIER_SYSTEM_PROMPT
 
 load_dotenv()
 
