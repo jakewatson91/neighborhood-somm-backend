@@ -2,6 +2,7 @@ import json
 import random
 import os
 import numpy as np
+from typing import List
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
@@ -10,6 +11,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import AsyncGroq 
+
+from prompts import SOMMELIER_SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -47,6 +50,8 @@ class UserPreferences(BaseModel):
     vibe: str
     type: str = "Any"
     maxPrice: float = 100.0
+    shuffle: bool = False
+    excludeIds: List[int] = []
 
 # New Model for the "Shuffle" endpoint
 class NoteRequest(BaseModel):
@@ -58,23 +63,19 @@ class NoteRequest(BaseModel):
 async def generate_sommelier_note(vibe: str, wine: dict):
     try:
         completion = await client.chat.completions.create(
-            model="moonshotai/kimi-k2-instruct-0905",
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-                    You are a hip sommelier. Be cool but not over the top.
-                    Explain your reasoning for your recommendation as it specifically relates to the user preferences. 
-                    Be casual. Mention the user's vibe and food pairings when applicable.
-                    """
-                },
-                {
-                    "role": "user",
-                    "content": f"User Vibe: {vibe}\nWine: {wine['title']}\nDescription: {wine.get('description', '')}"
-                }
-            ],
-            temperature=0.9,
-            max_tokens=125
+        model="moonshotai/kimi-k2-instruct-0905",
+        messages=[
+            {
+                "role": "system",
+                "content": SOMMELIER_SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": f"User Vibe: {vibe}\nWine: {json.dumps(wine)}"
+            }
+        ],
+        temperature=0.9,
+        max_tokens=200
         )
         return completion.choices[0].message.content
     except Exception as e:
@@ -102,32 +103,46 @@ async def find_wine(prefs: UserPreferences):
 
     # SORTING
     sorted_indices = np.argsort(scores)[::-1]
+    top_indices = sorted_indices[:10]
 
-    # --- FIX 3: RETURN THE LIST (TOP 50) ---
-    # We slice [:50] so the response isn't huge, but gives plenty of shuffle options
-    top_indices = sorted_indices[:50]
+    if prefs.shuffle:
+        candidate_pool = [
+            idx for idx in top_indices
+            if candidates[idx]['id'] not in prefs.excludeIds
+        ]
+        
+        # 3. Pick random
+        if candidate_pool:
+            wine_idx = random.choice(candidate_pool)
+            print(f"🎲 SHUFFLE: Picked random from {len(candidate_pool)} options (Excluded {len(prefs.excludeIds)})")
+        else:
+            # If they've seen all 20, just show the #1 result again or reset
+            wine_idx = sorted_indices[0]
+            print("⚠️ SHUFFLE: Pool exhausted, resetting to #1")
+
+    else:
+        wine_idx = top_indices[0]
     
-    results = []
-    for idx in top_indices:
-        w = candidates[idx].copy()
-        # Remove heavy vector data before sending to frontend
-        if 'embedding' in w: del w['embedding']
-        # Add score for debugging/UI
-        w['match_score'] = float(scores[idx])
-        results.append(w)
-    
+    wine = candidates[wine_idx]
+
+    formatted_wine = {
+            "id": int(wine['id']),
+            "title": wine['title'],
+            "handle": wine['handle'],
+            "price": wine['price'],
+            "image_url": wine['image_url'],
+            "product_type": wine['product_type'],
+            "description": wine['description'],
+            "tags": wine['tags'],
+            "features": wine['features'],
+            "match_score": float(scores[wine_idx])
+        } 
     # Generate note ONLY for the #1 result to start
-    first_wine = results[0]
-    ai_note = await generate_sommelier_note(prefs.vibe, first_wine)
+    ai_note = await generate_sommelier_note(prefs.vibe, formatted_wine)
 
-    print(f"Found wine: {first_wine.get('title')}") 
-    print(f"Wine features: {first_wine.get('features')} | {first_wine.get('tags')}")
-    print(f"Reasoning: {ai_note}")
-
-    return {
-        "results": results, # Frontend will store this array
-        "note": ai_note     # Note for index 0
-    }
+    print(f"Wine: {formatted_wine}")
+    print(f"\nNote: {ai_note}")
+    return {"wine": formatted_wine, "note": ai_note}
 
 # --- FIX 4: NEW ENDPOINT FOR SHUFFLING ---
 # Frontend calls this when user clicks "Find me something else"

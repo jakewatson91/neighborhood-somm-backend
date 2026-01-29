@@ -1,88 +1,84 @@
 import json
+import re
+import ast
 import pandas as pd
 from pathlib import Path
-from sentence_transformers import SentenceTransformer, util
-import torch
+from sentence_transformers import SentenceTransformer, CrossEncoder, util
 
-def strip_html(desc):
-    import re
-    clean_desc = re.sub(r'<[^>]+>', ' ', desc)
-    clean_desc = " ".join(clean_desc.split())
-    return clean_desc
+def strip_html(text):
+    if not isinstance(text, str): return ""
+    p = re.compile(r'<.*?>')
+    return p.sub('', text)
 
 def semantic_join():
-    print("⏳ Loading Models & Data...")
-    # 1. Load the Model (Free, Local, Fast)
-    model = SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)
-
-    # 2. Load "The Shelf" (Neighborhood Wines)
+    print("⏳ Loading Pipeline...")
+    # Fast Retriever
+    retriever = SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)
+    # Smart Reranker
+    reranker = CrossEncoder('BAAI/bge-reranker-base')
+    
     BASE_DIR = Path(__file__).resolve().parent.parent
-    with open(BASE_DIR / "data" / "neighborhood_full_inventory.json", 'r') as f:
-        shelf_data = json.load(f)
-    
-    # Create simple text representations for the Shelf
-    # "Producer + Title + Body" gives the best context
-    shelf_texts = [
-        f"{item.get('vendor', '')} {item['title']} {item.get('body_html', '')}" 
-        for item in shelf_data
+    with open(BASE_DIR / "data/neighborhood_full_inventory.json", 'r') as f:
+        raw_inventory = json.load(f)
+    encyclopedia_df = pd.read_csv(BASE_DIR / "data/x-wines/XWines_Slim_1K_wines.csv").fillna('')
+
+    # 1. PREP ENCYCLOPEDIA (Nomic Documents)
+    print("🧠 Indexing Encyclopedia...")
+    enc_texts = [
+        f"search_document: {r['Type']} wine. {r['Grapes']}. {r['WineryName']} {r['WineName']}"
+        for _, r in encyclopedia_df.iterrows()
     ]
+    enc_vecs = retriever.encode(enc_texts, convert_to_tensor=True)
 
-    # 3. Load "The Encyclopedia" (X-Wines)
-    # We only need a subset to match against (Title + Grapes + Region)
-    encyclopedia_df = pd.read_csv('data/x-wines/XWines_Slim_1K_wines.csv')
-    
-    # Create text representations for the Encyclopedia
-    encyclopedia_texts = [
-        f"{row['WineryName']} {row['WineName']} {row['RegionName']} {row['Grapes']}" 
-        for _, row in encyclopedia_df.iterrows()
-    ]
-
-    print("🧠 Vectorizing Datasets (This might take a minute)...")
-    shelf_embeddings = model.encode(shelf_texts, convert_to_tensor=True)
-    encyclopedia_embeddings = model.encode(encyclopedia_texts, convert_to_tensor=True)
-
-    print("🔗 Performing Semantic Join...")
-    # Find the top 1 closest match in the Encyclopedia for every Shelf Item
-    hits = util.semantic_search(shelf_embeddings, encyclopedia_embeddings, top_k=1)
-
+    # 2. MATCHING LOOP
     enriched_inventory = []
+    shelf_items = [i for i in raw_inventory if i.get('product_type') == "Wine" and i.get('images')]
 
-    for i, hit in enumerate(hits):
-        match_score = hit[0]['score']
-        match_idx = hit[0]['corpus_id']
+    print(f"🔍 Processing {len(shelf_items)} wines...")
+    for item in shelf_items:
+        # Construct Search Query
+        tags = " ".join(item.get('tags', []))
+        query = f"search_query: {tags} {item.get('title','')}"
         
-        item = shelf_data[i]
-
-        item['description'] = strip_html(item['description'])
+        # A. RETRIEVE TOP 10 (Nomic)
+        query_vec = retriever.encode(query, convert_to_tensor=True)
+        hits = util.semantic_search(query_vec, enc_vecs, top_k=10)[0]
         
-        # QUALITY GATE: Only enrich if similarity is > 60%
-        # Otherwise, we might be matching a "Gift Card" to a "Merlot"
-        if match_score > 0.6:
-            knowledge = encyclopedia_df.iloc[match_idx]
-            
-            # Enrich the item
-            item['inferred_features'] = {
-                'match_confidence': float(match_score),
-                'grape': knowledge['Grapes'],
-                'acidity': knowledge['Acidity'],
-                'body': knowledge['Body'],
-                'pairings': knowledge.get('Harmonize', []) # If available
-            }
-            # Add these keywords to the tags for easier UI filtering later
-            if 'tags' not in item: item['tags'] = []
-            if isinstance(item['tags'], list):
-                item['tags'].append(f"Grape: {knowledge['Grapes']}")
-        else:
-            item['inferred_features'] = None
+        # B. RE-RANK (BGE Reranker)
+        candidate_indices = [hit['corpus_id'] for hit in hits]
+        # Prepare pairs for the judge: [ [Query, Doc1], [Query, Doc2]... ]
+        pairs = [
+            [f"{tags} {item['title']}", enc_texts[idx].replace("search_document: ", "")] 
+            for idx in candidate_indices
+        ]
+        
+        scores = reranker.predict(pairs)
+        best_idx = candidate_indices[scores.argmax()]
+        
+        # 3. MERGE WINNER DATA
+        row = encyclopedia_df.iloc[best_idx]
+        try:
+            pairings = ast.literal_eval(row['Harmonize']) if isinstance(row['Harmonize'], str) else []
+        except: pairings = []
 
+        item['inferred_features'] = {
+            'body': row['Body'],
+            'acidity': row['Acidity'],
+            'type': row['Type'],
+            'grape': row['Grapes'],
+            'pairings': pairings
+        }
+        
+        # 4. FINAL APP EMBEDDING
+        search_blob = f"{item['title']} {row['Type']} {row['Grapes']} {' '.join(pairings)}"
+        item['embedding'] = retriever.encode(f"search_document: {search_blob}").tolist()
         enriched_inventory.append(item)
 
-    # 4. Save the "Smart" Inventory
-    with open(BASE_DIR / "data" / "final_enriched_inventory.json", 'w') as f:
-        json.dump(enriched_inventory, f, indent=4)
+    # SAVE
+    with open(BASE_DIR / "data/final_enriched_inventory.json", 'w') as f:
+        json.dump(enriched_inventory, f, indent=4, ensure_ascii=False)
 
-    print(f"🎉 Success! Enriched inventory saved. (Checked {len(shelf_data)} items)")
+    print("🎉 Enrichment Complete.")
 
 if __name__ == "__main__":
-    inv = semantic_join()
-    print(inv[0])
+    semantic_join()

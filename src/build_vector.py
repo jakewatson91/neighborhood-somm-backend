@@ -1,6 +1,12 @@
 import json
 from pathlib import Path
+import re
 from sentence_transformers import SentenceTransformer
+
+def strip_html(text):
+    p = re.compile(r'<.*?>')
+    # Use re.sub to replace all occurrences of the pattern with an empty string
+    return p.sub('', text)
 
 def build_vector():
     BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,7 +31,7 @@ def build_vector():
                 "price": float(w['variants'][0]['price']),
                 "image_url": w['images'][0]['src'] if w.get('images') else "",
                 "product_type": w.get('product_type', 'Wine'),
-                "description": w.get('body_html', '').replace('<p>', '').replace('</p>', ''), # Basic HTML strip
+                "description": strip_html(w.get('body_html', '')),
                 "tags": w.get('tags', []),
                 "features": w.get('inferred_features', {})
             }
@@ -33,9 +39,12 @@ def build_vector():
             features = clean_wine.get('features') or {}
             for_search = (
                 f"{clean_wine['title']} "
+                f"{clean_wine['description']} "
                 f"{' '.join(clean_wine['tags'])} "
                 f"{features.get('body', '')} "
-                f"{features.get('grape', '')}"
+                f"{features.get('grape', '')} "
+                f"{features.get('acidity', '')} "
+                f"{features.get('pairings', '')}"
             ).strip()
 
             clean_wine['embedding'] = model.encode(for_search).tolist()
@@ -45,7 +54,7 @@ def build_vector():
             continue
 
     with open(output_path, 'w') as f:
-        json.dump(clean_inv, f, indent=4)
+        json.dump(clean_inv, f, indent=4, ensure_ascii=False)
 
     print(f"Built {len(clean_inv)} vectorized wines and saved to {output_path}")
 
