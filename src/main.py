@@ -41,19 +41,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- FIX 1: LOAD THE VECTOR FILE ---
-BASE_DIR = Path(__file__).resolve().parent.parent
-# Make sure this points to the file created by build_vector.py
-VECTOR_DATA_PATH = BASE_DIR / "src/vector_inventory.json"
-
-try:
-    with open(VECTOR_DATA_PATH, "r") as f:
-        INVENTORY = json.load(f)
-    print(f"✅ API loaded {len(INVENTORY)} wines from {VECTOR_DATA_PATH}")
-except FileNotFoundError:
-    print(f"❌ API Error: Could not find inventory at {VECTOR_DATA_PATH}. Run build_vector.py!")
-    INVENTORY = []
-
 class UserPreferences(BaseModel):
     vibe: str
     type: str = "Any"
