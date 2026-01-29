@@ -3,7 +3,6 @@ import os
 import re
 import ast
 import pandas as pd
-import torch
 from pathlib import Path
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
 from supabase import create_client, Client
@@ -14,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 URL = os.getenv("SUPABASE_URL")
-KEY = os.getenv("SUPABASE_KEY")
+KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 supabase: Client = create_client(URL, KEY)
 

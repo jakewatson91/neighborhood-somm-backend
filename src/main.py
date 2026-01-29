@@ -1,7 +1,6 @@
 import json
 import random
 import os
-import numpy as np
 from typing import List
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
@@ -29,7 +28,7 @@ hf_client = InferenceClient(
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     )
 
 app = FastAPI()
