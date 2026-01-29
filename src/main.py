@@ -11,17 +11,26 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import AsyncGroq 
+from supabase import create_client, Client
+from huggingface_hub import InferenceClient
 
 from prompts import SOMMELIER_SYSTEM_PROMPT
 
 load_dotenv()
 
-# SETUP GROQ
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = AsyncGroq(api_key=GROQ_API_KEY)
+llm_client = AsyncGroq(
+    api_key=os.getenv("GROQ_API_KEY")
+    )
 
-print("\n🧠 Loading embedding model...")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+hf_client = InferenceClient(
+    provider="hf-inference",
+    api_key=os.environ["HF_TOKEN"],
+)
+
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+    )
 
 app = FastAPI()
 
@@ -62,7 +71,7 @@ class NoteRequest(BaseModel):
 # FIX 2: Added 'async' keyword here
 async def generate_sommelier_note(vibe: str, wine: dict):
     try:
-        completion = await client.chat.completions.create(
+        completion = await llm_client.chat.completions.create(
         model="moonshotai/kimi-k2-instruct-0905",
         messages=[
             {
@@ -75,7 +84,7 @@ async def generate_sommelier_note(vibe: str, wine: dict):
             }
         ],
         temperature=0.9,
-        max_tokens=200
+        max_tokens=125
         )
         return completion.choices[0].message.content
     except Exception as e:
@@ -86,63 +95,29 @@ async def generate_sommelier_note(vibe: str, wine: dict):
 async def find_wine(prefs: UserPreferences):
     print(f"\n🔎 SEARCHING | Vibe: '{prefs.vibe}' | Type: {prefs.type} | Max Price: ${prefs.maxPrice}")
 
-    candidates = [
-        w for w in INVENTORY 
-        if w.get("price", 0) <= prefs.maxPrice and
-        (w.get("product_type", "").lower() == "wine")
-    ]
-    
-    # Fallback if filters are too strict
-    if not candidates:
-        candidates = INVENTORY
+    vibe_vector = hf_client.feature_extraction(
+        text=prefs.vibe,
+        model="sentence-transformers/all-MiniLM-L6-v2"
+        ).tolist()
 
-    # VECTOR MATH
-    vibe_vector = embedding_model.encode(prefs.vibe).reshape(1, -1)
-    candidate_vectors = np.array([w["embedding"] for w in candidates])
-    scores = cosine_similarity(vibe_vector, candidate_vectors)[0]
+    # 2. Ask Supabase to do the math and filtering
+    # We ask for 20 so we have a pool to "Shuffle" from
+    rpc_params = {'query_embedding': vibe_vector, 'match_count': 20}
+    response = supabase.rpc('match_wines', rpc_params).execute()
 
-    # SORTING
-    sorted_indices = np.argsort(scores)[::-1]
-    top_indices = sorted_indices[:10]
+    candidates = response.data
 
     if prefs.shuffle:
-        candidate_pool = [
-            idx for idx in top_indices
-            if candidates[idx]['id'] not in prefs.excludeIds
-        ]
-        
-        # 3. Pick random
-        if candidate_pool:
-            wine_idx = random.choice(candidate_pool)
-            print(f"🎲 SHUFFLE: Picked random from {len(candidate_pool)} options (Excluded {len(prefs.excludeIds)})")
-        else:
-            # If they've seen all 20, just show the #1 result again or reset
-            wine_idx = sorted_indices[0]
-            print("⚠️ SHUFFLE: Pool exhausted, resetting to #1")
-
+        pool = [w for w in candidates if w['id'] not in prefs.excludeIds]
+        wine = random.choice(pool) if pool else candidates[0]
     else:
-        wine_idx = top_indices[0]
-    
-    wine = candidates[wine_idx]
+        wine = candidates[0]
 
-    formatted_wine = {
-            "id": int(wine['id']),
-            "title": wine['title'],
-            "handle": wine['handle'],
-            "price": wine['price'],
-            "image_url": wine['image_url'],
-            "product_type": wine['product_type'],
-            "description": wine['description'],
-            "tags": wine['tags'],
-            "features": wine['features'],
-            "match_score": float(scores[wine_idx])
-        } 
-    # Generate note ONLY for the #1 result to start
-    ai_note = await generate_sommelier_note(prefs.vibe, formatted_wine)
+    ai_note = await generate_sommelier_note(prefs.vibe, wine)
 
-    print(f"Wine: {formatted_wine}")
+    print(f"Wine: {wine}")
     print(f"\nNote: {ai_note}")
-    return {"wine": formatted_wine, "note": ai_note}
+    return {"wine": wine, "note": ai_note}
 
 # --- FIX 4: NEW ENDPOINT FOR SHUFFLING ---
 # Frontend calls this when user clicks "Find me something else"

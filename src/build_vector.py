@@ -1,62 +1,126 @@
 import json
-from pathlib import Path
+import os 
 import re
-from sentence_transformers import SentenceTransformer
+import ast
+import pandas as pd
+import torch
+from pathlib import Path
+from sentence_transformers import SentenceTransformer, CrossEncoder, util
+from supabase import create_client, Client
+import kagglehub
+from kagglehub import KaggleDatasetAdapter
+from dotenv import load_dotenv
+
+load_dotenv()
+
+URL = os.getenv("SUPABASE_URL")
+KEY = os.getenv("SUPABASE_KEY")
+
+supabase: Client = create_client(URL, KEY)
 
 def strip_html(text):
+    if not isinstance(text, str): return ""
     p = re.compile(r'<.*?>')
-    # Use re.sub to replace all occurrences of the pattern with an empty string
     return p.sub('', text)
 
-def build_vector():
+def enrich_inventory():
+    print("Loading models...")
+    retriever = SentenceTransformer('nomic-ai/nomic-embed-text-v1.5', trust_remote_code=True)
+
+    reranker = CrossEncoder('BAAI/bge-reranker-base')
+
+    final_vector_model = SentenceTransformer('all-MiniLM-L6-v2')
+
     BASE_DIR = Path(__file__).resolve().parent.parent
-    input_path = BASE_DIR / "data" / "final_enriched_inventory.json"
-    output_path = BASE_DIR / "src" / "vector_inventory.json"
+    with open(BASE_DIR / "data/neighborhood_full_inventory.json", 'r') as f:
+        raw_inventory = json.load(f)
 
-    print("Loading runtime model...")
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    reference_df = kagglehub.dataset_load(KaggleDatasetAdapter.PANDAS,
+        "rogerioxavier/x-wines-slim-version",
+        "XWines_Slim_1K_wines.csv"
+    ).fillna('')
 
-    clean_inv = []
+    print("🧠 Indexing Encyclopedia...")
+    enc_texts = [
+        f"search_document: {r['Type']} wine. {r['Grapes']}. {r['WineryName']} {r['WineName']}. Features: {r['Body']} {r['Acidity']} acidity."
+        for _, r in reference_df.iterrows()
+    ]
+    enc_vecs = retriever.encode(enc_texts, convert_to_tensor=True)
 
-    with open(input_path, 'r') as f:
-        data = json.load(f)
-
-    for w in data:
+    cellar = [i for i in raw_inventory if i.get('product_type') == "Wine" and i.get('images')]
+    
+    print(f"🔍 Processing {len(cellar)} wines...")
+    batch = []
+    batch_size = 50
+    count = 0
+    for bottle in cellar:
         try:
-            # Flattening the nested Shopify structure to match SQL columns
-            clean_wine = {
-                "id": w['id'],
-                "title": w['title'],
-                "handle": w['handle'],
-                "price": float(w['variants'][0]['price']),
-                "image_url": w['images'][0]['src'] if w.get('images') else "",
-                "product_type": w.get('product_type', 'Wine'),
-                "description": strip_html(w.get('body_html', '')),
-                "tags": w.get('tags', []),
-                "features": w.get('inferred_features', {})
+            tags = " ".join(bottle.get('tags', []))
+            query = f"search_query: {tags} {bottle.get('title','')}"
+            
+            query_vec = retriever.encode(query, convert_to_tensor=True)
+            hits = util.semantic_search(query_vec, enc_vecs, top_k=10)[0]
+            candidate_indices = [hit['corpus_id'] for hit in hits]
+
+            pairs = [
+                [f"{tags} {bottle['title']}", enc_texts[i].replace("search_document: ","")] 
+                for i in candidate_indices
+                ]
+
+            scores = reranker.predict(pairs)
+            row = reference_df.iloc[candidate_indices[scores.argmax()]]
+
+            # Clean and structure data
+            try:
+                pairings = ast.literal_eval(row['Harmonize']) if isinstance(row['Harmonize'], str) else []
+            except:
+                pairings = []
+
+            features = {
+                'body': row['Body'],
+                'acidity': row['Acidity'],
+                'grape': row['Grapes'],
+                'type': row['Type'],
+                'pairings': pairings
             }
 
-            features = clean_wine.get('features') or {}
-            for_search = (
-                f"{clean_wine['title']} "
-                f"{clean_wine['description']} "
-                f"{' '.join(clean_wine['tags'])} "
-                f"{features.get('body', '')} "
-                f"{features.get('grape', '')} "
-                f"{features.get('acidity', '')} "
-                f"{features.get('pairings', '')}"
-            ).strip()
+            # final vectorization
+            description = strip_html(bottle['body_html'])
+            for_search = f"{bottle['title']} {description} {tags} {features['grape']} {features['type']} {features['body']} {features['acidity']} {' '.join(pairings)}"
+            embedding = final_vector_model.encode(for_search).tolist()
 
-            clean_wine['embedding'] = model.encode(for_search).tolist()
-            clean_inv.append(clean_wine)
-        
-        except (IndexError, KeyError, ValueError):
+            # upload to supabase
+            wine_data = {
+                "id": bottle['id'],
+                "title": bottle['title'],
+                "handle": bottle['handle'],
+                "price": float(bottle['variants'][0]['price']),
+                "image_url": bottle['images'][0]['src'],
+                "product_type": bottle.get('product_type', 'Wine'),
+                "description": description,
+                "tags": bottle.get('tags', []),
+                "features": features,
+                "embedding": embedding
+            }
+
+            batch.append(wine_data)
+
+            if len(batch) == batch_size:
+                supabase.table("wines").upsert(batch).execute()
+                count += len(batch)
+                batch = []
+                print(f"[{count}/{len(cellar)}] Done.")
+
+        except Exception as e:
+            print(f"Failed to process wine {bottle['title']} with error: {e}")
             continue
 
-    with open(output_path, 'w') as f:
-        json.dump(clean_inv, f, indent=4, ensure_ascii=False)
-
-    print(f"Built {len(clean_inv)} vectorized wines and saved to {output_path}")
+    if batch:
+        supabase.table("wines").upsert(batch).execute()
+        count += len(batch)
+        batch = []
+    
+    print(f"[{count}/{len(cellar)}] Done ✅")
 
 if __name__ == "__main__":
-    build_vector()
+    enrich_inventory()
