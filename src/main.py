@@ -101,7 +101,9 @@ async def find_wine(prefs: UserPreferences):
 
     ai_note = await generate_sommelier_note(prefs.vibe, wine)
 
-    print(f"Wine: {wine}")
+    print("Candidates:\n")
+    print(f'{"\n".join([str((c["title"], c["tags"], c["similarity"])) for c in candidates])}')
+    print(f"\nWine: {wine}")
     print(f"\nNote: {ai_note}")
     return {"wine": wine, "note": ai_note}
 
@@ -118,4 +120,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host='127.0.0.1', port=8000, reload=True)
+    uvicorn.run("src.main:app", host='0.0.0.0', port=8000, reload=True)
