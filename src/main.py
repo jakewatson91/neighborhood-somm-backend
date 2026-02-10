@@ -70,7 +70,7 @@ async def generate_sommelier_note(vibe: str, wine: dict):
             }
         ],
         temperature=0.9,
-        max_tokens=125
+        max_tokens=200
         )
         return completion.choices[0].message.content
     except Exception as e:
