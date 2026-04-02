@@ -41,6 +41,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def warmup_model():
+    """Pre-load embedding model on startup to avoid cold-start latency"""
+    try:
+        print("🔥 Warming up embedding model...")
+        hf_client.feature_extraction(
+            text="warmup",
+            model="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        print("✅ Model warmed up")
+    except Exception as e:
+        print(f"⚠️ Warmup failed: {e}")
+
 class UserPreferences(BaseModel):
     vibe: str
     type: str = "Any"
